@@ -1,0 +1,335 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>ARN's - Earth Night Sky View</title>
+    <style>
+        html, body {
+            overflow: hidden; width: 100%; height: 100%; margin: 0; padding: 0; background-color: #000; color: #fff; font-family: Arial, sans-serif;
+        }
+        #renderCanvas { width: 100%; height: 100%; touch-action: none; outline: none; }
+        #loadingIndicator {
+            position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); font-size: 1.2em; color: #ccc; background-color: rgba(0,0,0,0.7); padding: 15px; border-radius: 8px; display: none; z-index: 20;
+        }
+        #instructions {
+             position: absolute; top: 10px; left: 10px; background-color: rgba(0, 0, 0, 0.6); padding: 5px 10px; border-radius: 5px; font-size: 0.8rem; color: #aaa; pointer-events: none; z-index: 10;
+         }
+    </style>
+    <script src="https://cdn.babylonjs.com/babylon.js"></script>
+    <script src="https://cdn.babylonjs.com/materialsLibrary/babylonjs.materials.min.js"></script> <!-- Needed for PhotoDome -->
+</head>
+<body>
+    <canvas id="renderCanvas"></canvas>
+    <div id="loadingIndicator">Loading Star Data...</div>
+    <div id="instructions">Drag to look around</div>
+
+    <script>
+        const canvas = document.getElementById('renderCanvas');
+        const engine = new BABYLON.Engine(canvas, true);
+        const loadingIndicator = document.getElementById('loadingIndicator');
+        let scene;
+
+        // --- Configuration ---
+        const CELESTIAL_SPHERE_RADIUS = 1000; // Arbitrary large radius for stars
+        const MAX_STAR_MAGNITUDE = 6.0; // Max apparent magnitude to show (naked eye limit ~6.5)
+        const MIN_STAR_SIZE = 0.5;
+        const MAX_STAR_SIZE = 5.0;
+        const SKY_ROTATION_SPEED = 0.00005; // Radians per frame (very slow)
+
+        // URL for HYG Database v3 CSV (Source: https://github.com/astronexus/HYG-Database)
+        // WARNING: This external URL might change or become unavailable.
+        const HYG_DATA_URL = 'https://raw.githubusercontent.com/astronexus/HYG-Database/master/hygdata_v3.csv';
+
+        // Milky Way equirectangular texture URL (Example from Babylon.js playground)
+        // Find a suitable high-res creative commons texture for better results.
+        const MILKYWAY_TEXTURE_URL = "https://playground.babylonjs.com/textures/milkyway.jpg";
+
+        let starData = []; // Will hold parsed stars: { id, hip, ra, dec, mag, properName, bayerDes }
+        let starPositions = {}; // Stores Vector3 position by HIP ID for lines: { hipId: Vector3 }
+
+        // --- Constellation Lines (Manual Definition - using HIP Ids from HYG) ---
+        // Add more constellations here referencing HIP IDs from the HYG dataset
+        const constellationLines = {
+            // Ursa Major (Big Dipper part)
+            "Ursa Major": [
+                [71908, 67301], [67301, 65378], [65378, 62956], [62956, 59774],
+                [59774, 58001], [58001, 54061] // Alkaid, Mizar, Alioth, Megrez, Phecda, Merak, Dubhe
+            ],
+            // Orion (Belt and main stars)
+            "Orion": [
+                [27989, 27366], [27366, 26727], // Belt: Alnitak, Alnilam, Mintaka
+                [28614, 27989], // Rigel to Alnitak
+                [24436, 26727], // Betelgeuse to Mintaka
+                [24436, 28614], // Connect Betelgeuse and Rigel roughly
+                [27989, 26207] // Alnitak to Saiph
+            ],
+             // Cassiopeia ('W' shape)
+            "Cassiopeia": [
+                [11767, 10602], [10602, 7479], [7479, 3821], [3821, 1586] // Caph, Schedar, Navi(Gamma), Ruchbah, Segin
+            ]
+            // ... add more constellations as needed, finding HIP IDs
+        };
+
+
+        // --- Main Async Function ---
+        async function setupScene() {
+            loadingIndicator.style.display = 'block';
+
+            try {
+                await loadStarData();
+                scene = createSkyScene();
+
+                 // Hide loading indicator once scene is ready (PCS mesh built)
+                 const pcsMesh = scene.getMeshByName("starPCS");
+                 if (pcsMesh && pcsMesh.isReady()) {
+                    loadingIndicator.style.display = 'none';
+                 } else if (pcsMesh) {
+                    // Wait slightly if PCS is still building
+                    setTimeout(() => { loadingIndicator.style.display = 'none';}, 2000);
+                 } else {
+                     loadingIndicator.style.display = 'none'; // Hide anyway if no PCS
+                 }
+
+                engine.runRenderLoop(() => {
+                    if (scene && scene.activeCamera) {
+                        scene.render();
+                    }
+                });
+
+            } catch (error) {
+                console.error("Failed to setup scene:", error);
+                loadingIndicator.textContent = "Error loading star data. See console.";
+                loadingIndicator.style.color = "red";
+            }
+        }
+
+        // --- Data Loading and Parsing ---
+        async function loadStarData() {
+            console.log("Fetching star data from:", HYG_DATA_URL);
+            const response = await fetch(HYG_DATA_URL);
+            if (!response.ok) {
+                throw new Error(`HTTP error! status: ${response.status} when fetching star data.`);
+            }
+            const csvData = await response.text();
+            console.log("Star data fetched, parsing...");
+
+            starData = parseHygCsv(csvData);
+            console.log(`Parsed ${starData.length} stars (filtered by magnitude <= ${MAX_STAR_MAGNITUDE})`);
+        }
+
+        function parseHygCsv(csvText) {
+            const lines = csvText.split('\n');
+            const headers = lines[0].split(',');
+            const parsedStars = [];
+
+            // Find column indices (important as CSV structure might vary slightly)
+            const idIndex = headers.indexOf('id');
+            const hipIndex = headers.indexOf('hip'); // Hipparcos ID, good for lookups
+            const properIndex = headers.indexOf('proper'); // Proper name
+            const bayerIndex = headers.indexOf('bayer');   // Bayer designation (e.g., Alp Ori)
+            const raIndex = headers.indexOf('ra');         // Right Ascension (Hours)
+            const decIndex = headers.indexOf('dec');        // Declination (Degrees)
+            const magIndex = headers.indexOf('mag');        // Apparent Magnitude
+
+            if (raIndex === -1 || decIndex === -1 || magIndex === -1) {
+                throw new Error("Could not find required columns (ra, dec, mag) in CSV headers.");
+            }
+
+            for (let i = 1; i < lines.length; i++) {
+                const values = lines[i].split(',');
+                if (values.length > Math.max(raIndex, decIndex, magIndex)) {
+                    const mag = parseFloat(values[magIndex]);
+                    // Filter dim stars early to reduce memory/processing
+                    if (!isNaN(mag) && mag <= MAX_STAR_MAGNITUDE) {
+                        const ra = parseFloat(values[raIndex]);
+                        const dec = parseFloat(values[decIndex]);
+                        if (!isNaN(ra) && !isNaN(dec)) {
+                             const star = {
+                                id: values[idIndex] ? parseInt(values[idIndex]) : null,
+                                hip: values[hipIndex] ? parseInt(values[hipIndex]) : null, // Store HIP id
+                                ra: ra,
+                                dec: dec,
+                                mag: mag,
+                                properName: values[properIndex] || null,
+                                bayerDes: values[bayerIndex] || null
+                             };
+                             // Only add stars with valid positions and magnitude
+                             parsedStars.push(star);
+                        }
+                    }
+                }
+            }
+            return parsedStars;
+        }
+
+
+        // --- Coordinate Conversion ---
+        function raDecToCelestialSphere(raHours, decDegrees, radius) {
+            const raRad = (raHours * 15) * (Math.PI / 180); // RA Hours to Radians
+            const decRad = decDegrees * (Math.PI / 180);   // DEC Degrees to Radians
+
+            // Babylon.js Y-UP coordinate system:
+            // X = R * cos(dec) * cos(ra)
+            // Y = R * sin(dec)                   <- Altitude
+            // Z = R * cos(dec) * sin(ra)
+            const x = radius * Math.cos(decRad) * Math.cos(raRad);
+            const y = radius * Math.sin(decRad);
+            const z = radius * Math.cos(decRad) * Math.sin(raRad);
+
+            return new BABYLON.Vector3(x, y, z);
+        }
+
+        // --- Magnitude to Visual Mapping ---
+        function getStarSize(magnitude) {
+             // Clamp magnitude for scaling (e.g., stars brighter than -1 treated as -1)
+            const clampedMag = Math.max(-1.5, magnitude);
+            // Linear interpolation: Brighter (smaller mag) -> Larger size
+            const size = MAX_STAR_SIZE - ((clampedMag + 1.5) / (MAX_STAR_MAGNITUDE + 1.5)) * (MAX_STAR_SIZE - MIN_STAR_SIZE);
+            return Math.max(MIN_STAR_SIZE, size); // Ensure minimum size
+        }
+
+         function getStarAlpha(magnitude) {
+             // Brighter stars more opaque
+            const alpha = Math.max(0.4, (MAX_STAR_MAGNITUDE - magnitude) / MAX_STAR_MAGNITUDE);
+             return Math.min(1.0, alpha * 1.5); // Boost alpha slightly, but clamp at 1.0
+         }
+
+
+        // --- Scene Creation ---
+        function createSkyScene() {
+            const scene = new BABYLON.Scene(engine);
+            scene.clearColor = new BABYLON.Color4(0.0, 0.0, 0.0, 1.0); // Black background
+
+            // Camera looking out from the center
+            const camera = new BABYLON.ArcRotateCamera("camera", -Math.PI / 2, Math.PI / 2.2, 0, BABYLON.Vector3.Zero(), scene);
+            camera.attachControl(canvas, true);
+            camera.inputs.remove(camera.inputs.attached.mousewheel); // Disable zoom
+             camera.inputs.remove(camera.inputs.attached.pointers.pinch); // Disable pinch zoom
+             camera.inertia = 0.8; // Add some drag inertia
+             camera.panningSensibility = 0; // Disable panning
+
+            // Parent node for all celestial objects to rotate together
+            const skyParent = new BABYLON.TransformNode("skyParent", scene);
+
+            // Milky Way Background
+            try {
+                 // Higher resolution (e.g., 4096) is recommended if available
+                 const photoDome = new BABYLON.PhotoDome(
+                     "milkywayDome",
+                     MILKYWAY_TEXTURE_URL,
+                     { resolution: 1024, size: CELESTIAL_SPHERE_RADIUS * 1.5 }, // Size slightly larger than stars
+                     scene
+                 );
+                 photoDome.rotation.y = Math.PI; // Adjust rotation if texture alignment is off
+                 photoDome.mesh.parent = skyParent; // Rotate dome with the sky
+                 photoDome.mesh.isPickable = false;
+            } catch (e) {
+                console.warn("Could not load PhotoDome texture. Background will be black.", e);
+            }
+
+
+            // Stars using PointsCloudSystem (PCS)
+             console.log("Building star point cloud...");
+            const pcs = new BABYLON.PointsCloudSystem("starPCS", 1.0, scene); // Base size = 1
+
+            const pcsFunc = function (particle, i, s) {
+                const star = starData[i];
+                 if (!star || star.mag > MAX_STAR_MAGNITUDE) { // Double check filter
+                     particle.position = BABYLON.Vector3.Zero(); // Should not happen if pre-filtered
+                     particle.color = new BABYLON.Color4(0,0,0,0);
+                     return;
+                 }
+
+                particle.position = raDecToCelestialSphere(star.ra, star.dec, CELESTIAL_SPHERE_RADIUS);
+
+                 // Store position by HIP ID if available (needed for constellation lines)
+                 if (star.hip) {
+                    starPositions[star.hip] = particle.position.clone(); // Store a clone
+                 }
+
+                particle.size = getStarSize(star.mag);
+                const alpha = getStarAlpha(star.mag);
+                // Could add color based on spectral type (bv column in HYG) if parsed
+                particle.color = new BABYLON.Color4(1.0, 1.0, 1.0, alpha);
+
+                // Add metadata (optional, could be used for picking)
+                // particle.props = { name: star.properName || star.bayerDes || `HIP ${star.hip}`, mag: star.mag };
+            };
+
+            pcs.addPoints(starData.length, pcsFunc);
+            pcs.buildMeshAsync().then((mesh) => {
+                if(mesh) {
+                     mesh.parent = skyParent; // Parent stars to the rotating node
+                     mesh.isPickable = false; // Don't allow picking individual points for now
+                     console.log("Star point cloud built.");
+                      // Attempt to hide loading indicator again after mesh is built
+                     loadingIndicator.style.display = 'none';
+                 }
+            }).catch(err => {
+                console.error("Error building PCS mesh:", err);
+                loadingIndicator.textContent = "Error building stars.";
+                loadingIndicator.style.color = "red";
+            });
+
+
+            // Constellation Lines
+            console.log("Drawing constellation lines...");
+            const lineMeshes = [];
+            const lineMaterial = new BABYLON.StandardMaterial("lineMat", scene);
+            lineMaterial.emissiveColor = new BABYLON.Color3(0.3, 0.5, 0.8); // Bluish lines
+            lineMaterial.alpha = 0.5;
+            lineMaterial.disableLighting = true;
+
+            for (const constellationName in constellationLines) {
+                const lines = constellationLines[constellationName];
+                const linePoints = [];
+                lines.forEach(pair => {
+                    const hip1 = pair[0];
+                    const hip2 = pair[1];
+                    const pos1 = starPositions[hip1];
+                    const pos2 = starPositions[hip2];
+                    if (pos1 && pos2) {
+                        linePoints.push([pos1, pos2]);
+                    } else {
+                        // console.warn(`Missing star positions for line in ${constellationName}: HIP ${hip1} or ${hip2}`);
+                    }
+                });
+
+                if (linePoints.length > 0) {
+                     const lineSystem = BABYLON.MeshBuilder.CreateLineSystem(constellationName + "Lines", {
+                        lines: linePoints,
+                        updatable: false
+                    }, scene);
+                     lineSystem.color = new BABYLON.Color3(0.3, 0.5, 0.8); // Set color directly
+                     lineSystem.alpha = 0.5;
+                     lineSystem.isPickable = false;
+                     lineSystem.parent = skyParent; // Parent lines to the rotating node
+                     lineMeshes.push(lineSystem);
+                }
+            }
+            console.log("Constellation lines drawn.");
+
+
+            // Sky Rotation
+            const rotationAxis = new BABYLON.Vector3(0, 1, 0); // Rotate around celestial pole (Y-axis)
+            scene.onBeforeRenderObservable.add(() => {
+                skyParent.rotate(rotationAxis, SKY_ROTATION_SPEED, BABYLON.Space.WORLD);
+            });
+
+            return scene;
+        }
+
+
+        // --- Start Everything ---
+        setupScene();
+
+
+        // --- Resize Handling ---
+        window.addEventListener('resize', () => {
+            engine.resize();
+        });
+
+    </script>
+</body>
+</html>
